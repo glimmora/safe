@@ -1,51 +1,48 @@
 // ============================================================================
 // config/contracts.ts — Deployed contract addresses and known OCS01 tokens
 // ----------------------------------------------------------------------------
-// IMPORTANT: Update these addresses after deploying contracts to devnet.
-// See README.md for deployment instructions.
+// Addresses can be set via environment variables (VITE_DEVNET_TEST_TOKEN_ADDR,
+// etc.) OR hardcoded here after deployment.
 // ============================================================================
 
 import type { TokenInfo } from '@/types'
 
 // ---------------------------------------------------------------------------
 // Deployed contract addresses per network.
-// Replace with actual addresses after running the deploy flow.
+// Override via env vars (see .env.example) or hardcode here.
 // ---------------------------------------------------------------------------
 export const CONTRACT_ADDRESSES = {
   mainnet: {
-    factory: '',  // TODO: deploy OctraSafeFactory to mainnet, paste address here
-    testToken: '', // TODO: deploy TestOCS01 to mainnet, paste address here
+    factory: import.meta.env.VITE_MAINNET_FACTORY_ADDR || '',
+    testToken: import.meta.env.VITE_MAINNET_TEST_TOKEN_ADDR || '',
   },
   devnet: {
-    factory: '',  // TODO: deploy OctraSafeFactory to devnet, paste address here
-    testToken: '', // TODO: deploy TestOCS01 to devnet, paste address here
+    factory: import.meta.env.VITE_DEVNET_FACTORY_ADDR || '',
+    testToken: import.meta.env.VITE_DEVNET_TEST_TOKEN_ADDR || '',
   },
 } as const
 
 // ---------------------------------------------------------------------------
 // Known OCS01 tokens per network.
-// Add token addresses here after deploying them.
+// If testToken address is set (via env or hardcoded), it's auto-added here.
 // ---------------------------------------------------------------------------
+function buildKnownTokens(network: 'mainnet' | 'devnet'): TokenInfo[] {
+  const tokens: TokenInfo[] = []
+  const testTokenAddr = CONTRACT_ADDRESSES[network].testToken
+  if (testTokenAddr) {
+    tokens.push({
+      address: testTokenAddr,
+      name: 'TestOCS01',
+      symbol: 'TEST',
+      decimals: 6,
+    })
+  }
+  return tokens
+}
+
 export const KNOWN_TOKENS: Record<string, TokenInfo[]> = {
-  mainnet: [
-    // Example:
-    // {
-    //   address: 'oct...',
-    //   name: 'TestOCS01',
-    //   symbol: 'TEST',
-    //   decimals: 6,
-    // },
-  ],
-  devnet: [
-    // The TestOCS01 token will be added here after deployment.
-    // Example:
-    // {
-    //   address: 'oct...',
-    //   name: 'TestOCS01',
-    //   symbol: 'TEST',
-    //   decimals: 6,
-    // },
-  ],
+  mainnet: buildKnownTokens('mainnet'),
+  devnet: buildKnownTokens('devnet'),
 }
 
 // Helper: get factory address for the current network

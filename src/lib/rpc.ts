@@ -69,14 +69,21 @@ export function clearCache() {
 }
 
 // Core RPC call function. Uses fetch with AbortController for timeout.
+// Includes retry logic for transient network errors (502, timeout, fetch fail).
 export async function rpcCall<T = unknown>(
   rpcUrl: string,
   method: string,
   params: unknown[] = [],
-  opts: { timeoutMs?: number; cacheTtlMs?: number; cacheKey?: string } = {}
+  opts: {
+    timeoutMs?: number
+    cacheTtlMs?: number
+    cacheKey?: string
+    retries?: number       // number of retries on transient errors (default 2)
+    retryDelayMs?: number  // delay between retries (default 1000ms)
+  } = {}
 ): Promise<T> {
   const cacheKey = opts.cacheKey ?? `${rpcUrl}:${method}:${JSON.stringify(params)}`
-  if (opts.cacheTtlMs && opts.cacheKey !== undefined) {
+  if (opts.cacheTtlMs) {
     const cached = cacheGet(cacheKey)
     if (cached !== undefined) return cached as T
   }
@@ -88,41 +95,87 @@ export async function rpcCall<T = unknown>(
     params,
   }
 
-  const controller = new AbortController()
-  const timeout = opts.timeoutMs ?? RPC_TIMEOUT
-  const timer = setTimeout(() => controller.abort(), timeout)
+  const maxRetries = opts.retries ?? 2
+  const retryDelay = opts.retryDelayMs ?? 1000
+  let lastError: Error | null = null
 
-  try {
-    const res = await fetch(rpcUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req),
-      signal: controller.signal,
-    })
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const controller = new AbortController()
+    const timeout = opts.timeoutMs ?? RPC_TIMEOUT
+    const timer = setTimeout(() => controller.abort(), timeout)
 
-    if (!res.ok) {
-      const text = await res.text().catch(() => '')
-      throw new RpcError(-32603, `HTTP ${res.status}: ${text || res.statusText}`)
+    try {
+      const res = await fetch(rpcUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(req),
+        signal: controller.signal,
+      })
+
+      // Check for HTTP errors
+      if (!res.ok) {
+        const text = await res.text().catch(() => '')
+        const err = new RpcError(-32603, `HTTP ${res.status}: ${text.slice(0, 200) || res.statusText}`)
+
+        // Retry on 502 (Bad Gateway), 503 (Service Unavailable), 504 (Gateway Timeout)
+        if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt < maxRetries) {
+          console.warn(`[rpc] ${method} got HTTP ${res.status}, retrying (${attempt + 1}/${maxRetries})...`)
+          lastError = err
+          clearTimeout(timer)
+          await new Promise((r) => setTimeout(r, retryDelay * (attempt + 1)))
+          continue
+        }
+        throw err
+      }
+
+      const json: RpcResponse<T> = await res.json()
+
+      if (json.error) {
+        throw new RpcError(json.error.code, json.error.message, json.error.data)
+      }
+
+      if (json.result === undefined) {
+        throw new RpcError(-32603, 'RPC returned no result')
+      }
+
+      if (opts.cacheTtlMs) {
+        cacheSet(cacheKey, json.result, opts.cacheTtlMs)
+      }
+
+      return json.result
+    } catch (e: any) {
+      // "Failed to fetch" — browser-level network error (CORS, DNS, connection refused, etc.)
+      const isFetchError = e instanceof TypeError && e.message.includes('Failed to fetch')
+      const isAbortError = e instanceof DOMException && e.name === 'AbortError'
+
+      if (isFetchError || isAbortError) {
+        lastError = new RpcError(
+          -32603,
+          isFetchError
+            ? `Network error: Failed to fetch ${rpcUrl}. The RPC server may be down, blocking CORS, or unreachable.`
+            : `Request timeout after ${timeout}ms`
+        )
+        if (attempt < maxRetries) {
+          console.warn(`[rpc] ${method} ${isFetchError ? 'fetch failed' : 'timed out'}, retrying (${attempt + 1}/${maxRetries})...`)
+          clearTimeout(timer)
+          await new Promise((r) => setTimeout(r, retryDelay * (attempt + 1)))
+          continue
+        }
+        throw lastError
+      }
+
+      // RpcError from HTTP status check above — already has context
+      if (e instanceof RpcError) throw e
+
+      // Unknown error
+      throw new RpcError(-32603, e?.message || 'Unknown RPC error')
+    } finally {
+      clearTimeout(timer)
     }
-
-    const json: RpcResponse<T> = await res.json()
-
-    if (json.error) {
-      throw new RpcError(json.error.code, json.error.message, json.error.data)
-    }
-
-    if (json.result === undefined) {
-      throw new RpcError(-32603, 'RPC returned no result')
-    }
-
-    if (opts.cacheTtlMs) {
-      cacheSet(cacheKey, json.result, opts.cacheTtlMs)
-    }
-
-    return json.result
-  } finally {
-    clearTimeout(timer)
   }
+
+  // Should not reach here, but just in case
+  throw lastError ?? new RpcError(-32603, 'RPC failed after retries')
 }
 
 // ===========================================================================

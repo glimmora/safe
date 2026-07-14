@@ -169,7 +169,21 @@ export function CreateSafeForm() {
       // Navigate to the new Safe detail page
       navigate(`/safe/${addrResult.address}`)
     } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Deploy failed'
+      let msg = e instanceof Error ? e.message : 'Deploy failed'
+      // Friendlier messages for common errors
+      if (msg.includes('Failed to fetch')) {
+        msg = 'Cannot reach the Octra RPC server. The devnet may be temporarily down (502). Please wait a few minutes and try again, or switch to mainnet.'
+      } else if (msg.includes('HTTP 502')) {
+        msg = 'Octra RPC returned 502 (Bad Gateway). The devnet server is down. Please try again later.'
+      } else if (msg.includes('HTTP 429')) {
+        msg = 'Octra RPC rate-limited (429). Please wait a minute and try again.'
+      } else if (msg.includes('USER_REJECTED') || msg.includes('rejected')) {
+        msg = 'Transaction rejected in 0xio wallet.'
+      } else if (msg.includes('WALLET_LOCKED') || msg.includes('locked')) {
+        msg = '0xio wallet is locked. Please unlock it and try again.'
+      } else if (msg.includes('EXTENSION_NOT_FOUND') || msg.includes('not detected')) {
+        msg = '0xio wallet extension not detected. Install it from the Chrome Web Store.'
+      }
       setDeployError(msg)
       toast.error('Deploy failed', { description: msg, duration: 8000 })
     } finally {
