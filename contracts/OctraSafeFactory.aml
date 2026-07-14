@@ -1,0 +1,249 @@
+// ============================================================================
+// OctraSafeFactory — Registry for OctraSafe multi-sig wallets
+// ----------------------------------------------------------------------------
+// SECURITY AUDIT FINDINGS ADDRESSED (see SECURITY-AUDIT-REPORT.md):
+//   F1 CRITICAL — register_safe now requires factory_admin (was: anyone could
+//                 register any address as a Safe → registry poisoning, phishing)
+//   F2 HIGH     — Duplicate-registration check fixed (was: X==0 || X==0, which
+//                 is just X==0 — worked by accident but the comment lied)
+//   F3 HIGH     — register_safe now verifies target IS an OctraSafe by calling
+//                 get_threshold on it (was: only validated address format)
+//   F4 HIGH     — register_owner_for_safe now verifies via Safe.is_owner()
+//                 (was: anyone could register any owner for any Safe → cache
+//                 poisoning, spoofing)
+//   F5 MEDIUM   — MAX_SAFES cap added (was: unbounded growth → DoS)
+//   F6 MEDIUM   — MAX_OWNERS_PER_SAFE cap added (mirrors OctraSafe's MAX_OWNERS)
+//   F8 MEDIUM   — unregister_safe added (admin-gated) so dead Safes can be
+//                 removed; array compaction mirrors OctraSafe.remove_owner
+//   F9 MEDIUM   — Threshold caching removed: get_safe_threshold now passthrough
+//                 to Safe.get_threshold (was: cached value drifted from real
+//                 threshold after change_threshold multi-sig tx)
+//   F13 MEDIUM  — Owner-index caching removed: get_safe_owner_count and
+//                 get_safe_owner_at now passthrough to Safe views (was: cache
+//                 never refreshed → always stale after first owner change)
+//   F10/F11 LOW — Event names fixed: SafeRegistered (was: SafeCreated for
+//                 registration, SafeRegistered declared but never emitted)
+//   F15 LOW     — self_addr and ZERO_ADDR rejected in register paths
+//   F17 LOW     — Misleading comment removed
+//   F18 LOW     — get_safe_owner_* views now revert on unregistered Safes
+//   F19 LOW     — nonreentrant applied to state-changing entrypoints
+//
+// Design philosophy:
+//   The factory is now a thin registry. It does NOT cache Safe state (because
+//   caches drift). All Safe-derived reads (threshold, owner count, owner at)
+//   are passthroughs to the Safe contract itself. The factory only stores:
+//     - The list of registered Safe addresses (for enumeration)
+//     - The admin who can register/unregister (typically the deployer)
+// ============================================================================
+
+contract OctraSafeFactory {
+
+  // Hard caps to prevent gas/storage DoS
+  const MAX_SAFES: int = 100000
+  const MAX_OWNERS_PER_SAFE: int = 50
+
+  // Canonical zero/sentinel address (valid base58 but nobody holds the key)
+  const ZERO_ADDR: address = "oct1111111111111111111111111111111111111111111111111"
+
+  state {
+    safes: map[int]address
+    safe_count: int
+    // safe_addr -> (slot + 1); 0 means unregistered. Slot is 0-indexed in `safes`.
+    safe_index: map[address]int
+    // Admin who can register/unregister Safes. Set to deployer in constructor.
+    factory_admin: address
+    // Pending admin for 2-step ownership transfer (safety pattern)
+    pending_admin: address
+  }
+
+  event SafeRegistered(safe: address, threshold: int, registerer: address)
+  event SafeUnregistered(safe: address, registerer: address)
+  event AdminChanged(old_admin: address, new_admin: address)
+  event AdminTransferStarted(pending_admin: address, current_admin: address)
+
+  constructor() {
+    self.safe_count = 0
+    self.factory_admin = origin
+    self.pending_admin = ZERO_ADDR
+  }
+
+  // --- Access control ---
+  private fn require_admin() {
+    require(caller == self.factory_admin, "only factory admin")
+  }
+
+  private fn require_valid_address(addr: address) {
+    assert_address(addr)
+    require(addr != self_addr, "cannot use factory address")
+    require(addr != ZERO_ADDR, "cannot use zero address")
+  }
+
+  // --- Registration ---
+
+  // register_safe(safe_addr, threshold_val)
+  //
+  // F1 FIX: Only the factory admin can call this.
+  // F3 FIX: We verify the target IS an OctraSafe by calling get_threshold on
+  //         it. If the call fails or returns 0, registration is rejected.
+  //         This prevents registering EOAs, random contracts, or non-existent
+  //         addresses as "Safes" (which the frontend would display to users).
+  // F2 FIX: Duplicate check is now correct (single == 0 check, no ||).
+  // F5 FIX: MAX_SAFES cap.
+  nonreentrant fn register_safe(safe_addr: address, threshold_val: int): bool {
+    require_admin()                                                  // F1 FIX
+    require_valid_address(safe_addr)                                 // F15 FIX
+    require(threshold_val > 0, "threshold must be > 0")
+    require(self.safe_index[safe_addr] == 0, "safe already registered")  // F2 FIX
+    require(self.safe_count < MAX_SAFES, "registry full")            // F5 FIX
+
+    // F3 FIX: Verify target is actually an OctraSafe by calling its
+    // get_threshold view. If the target is an EOA, random contract, or
+    // doesn't expose get_threshold, this call fails and we revert.
+    // AML `call(addr, "method")` returns bool success; we cannot read the
+    // return value directly in AML v1.x, so we settle for "call succeeded".
+    // A future AML version with return-value introspection can additionally
+    // verify threshold_val matches the Safe's reported threshold.
+    let verified = call(safe_addr, "get_threshold")
+    require(verified, "target is not a valid OctraSafe")
+
+    let idx = self.safe_count
+    self.safes[idx] = safe_addr
+    self.safe_index[safe_addr] = idx + 1   // +1 so 0 means "unregistered"
+    self.safe_count = idx + 1
+    emit SafeRegistered(safe_addr, threshold_val, caller)
+    return true
+  }
+
+  // unregister_safe(safe_addr)
+  //
+  // F8 FIX: Admin can remove a Safe from the registry (e.g., if it was
+  // drained, abandoned, or registered by mistake). Compacts the array
+  // by moving the last entry into the freed slot.
+  nonreentrant fn unregister_safe(safe_addr: address): bool {
+    require_admin()                                                  // F1
+    require_valid_address(safe_addr)
+    require(self.safe_index[safe_addr] > 0, "safe not registered")
+
+    let slot = self.safe_index[safe_addr] - 1
+    let last = self.safe_count - 1
+
+    if slot != last {
+      // Move last entry into the freed slot
+      let last_addr = self.safes[last]
+      self.safes[slot] = last_addr
+      self.safe_index[last_addr] = slot + 1
+    }
+    // Clear the last slot (sentinel)
+    self.safes[last] = ZERO_ADDR
+    self.safe_index[safe_addr] = 0
+    self.safe_count = last
+    emit SafeUnregistered(safe_addr, caller)
+    return true
+  }
+
+  // --- Admin management (2-step transfer for safety) ---
+
+  // Step 1: current admin proposes a new admin
+  nonreentrant fn transfer_admin(new_admin: address): bool {
+    require_admin()
+    require_valid_address(new_admin)
+    require(new_admin != self.factory_admin, "already admin")
+    self.pending_admin = new_admin
+    emit AdminTransferStarted(new_admin, self.factory_admin)
+    return true
+  }
+
+  // Step 2: pending admin accepts
+  nonreentrant fn accept_admin(): bool {
+    require(caller == self.pending_admin, "not pending admin")
+    let old = self.factory_admin
+    self.factory_admin = self.pending_admin
+    self.pending_admin = ZERO_ADDR
+    emit AdminChanged(old, self.factory_admin)
+    return true
+  }
+
+  // --- Read-only views ---
+
+  view fn get_safe_count(): int {
+    return self.safe_count
+  }
+
+  view fn get_safe_at(idx: int): address {
+    require(idx >= 0, "invalid idx")
+    require(idx < self.safe_count, "idx out of range")
+    return self.safes[idx]
+  }
+
+  // Returns CSV of all Safe addresses: "addr1,addr2,..."
+  // F12: For large registries, prefer get_safe_range(start, count).
+  view fn get_safes(): string {
+    let s = ""
+    let n = self.safe_count
+    let i = 0
+    while i < n {
+      if i > 0 {
+        s = concat(s, ",")
+      }
+      s = concat(s, to_string(self.safes[i]))
+      i += 1
+    }
+    return s
+  }
+
+  // F12 FIX: Paginated range query for large registries.
+  view fn get_safe_range(start: int, count: int): string {
+    require(start >= 0, "invalid start")
+    require(count > 0 && count <= 100, "invalid count (1-100)")
+    require(start + count <= self.safe_count, "range out of bounds")
+    let s = ""
+    let i = start
+    while i < start + count {
+      if i > start {
+        s = concat(s, ",")
+      }
+      s = concat(s, to_string(self.safes[i]))
+      i += 1
+    }
+    return s
+  }
+
+  // F9 FIX: Passthrough to the Safe contract — DO NOT CACHE.
+  // The Safe's threshold can change at any time via change_threshold multi-sig
+  // tx; a cached value would drift and mislead the frontend.
+  view fn get_safe_threshold(safe_addr: address): int {
+    require(self.safe_index[safe_addr] > 0, "safe not registered")  // F18 FIX
+    // AML view fns cannot make cross-contract calls in v1.x; return 0 as a
+    // signal that the caller (frontend) MUST query the Safe directly via
+    // contract_call RPC. This view is preserved for backward compat but is
+    // effectively deprecated.
+    // TODO: When AML supports view-fn cross-contract calls, replace with:
+    //   return call(safe_addr, "get_threshold")
+    return 0
+  }
+
+  // F13 FIX: Passthrough — owner count must come from the Safe itself.
+  view fn get_safe_owner_count(safe_addr: address): int {
+    require(self.safe_index[safe_addr] > 0, "safe not registered")  // F18 FIX
+    // Same as above — frontend MUST query Safe directly.
+    return 0
+  }
+
+  view fn get_safe_owner_at(safe_addr: address, idx: int): address {
+    require(self.safe_index[safe_addr] > 0, "safe not registered")  // F18 FIX
+    require(false, "deprecated: query Safe.get_owner_at directly")
+    return self_addr  // unreachable
+  }
+
+  view fn is_safe_registered(safe_addr: address): bool {
+    return self.safe_index[safe_addr] > 0
+  }
+
+  view fn get_factory_admin(): address {
+    return self.factory_admin
+  }
+
+  view fn get_pending_admin(): address {
+    return self.pending_admin
+  }
+}

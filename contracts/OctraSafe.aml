@@ -1,0 +1,485 @@
+// ============================================================================
+// OctraSafe — Multi-signature Wallet Smart Contract (AML) — v2 SECURITY-HARDENED
+// ----------------------------------------------------------------------------
+// Implements a Gnosis-Safe-style multi-sig wallet on the Octra blockchain.
+//
+// SECURITY AUDIT FINDINGS ADDRESSED (see SECURITY-AUDIT-REPORT.md):
+//   R1 CRITICAL — Owner mgmt functions now require_self_call() (was: any
+//                 owner could call add_owner/remove_owner/change_threshold
+//                 directly, bypassing multi-sig threshold — Parity-class bug)
+//   R2 CRITICAL — execute_transaction now marks tx_executed BEFORE any external
+//                 call (CEI pattern). Was: set after call → reentrancy double-spend.
+//   R3 HIGH     — All state-changing entrypoints marked nonreentrant
+//   R4 HIGH     — submit_transaction now always validates `to` address
+//   R5 HIGH     — submit_transaction rejects no-op txs (value=0 && data="")
+//   R7 MEDIUM   — remove_owner placeholder bug fixed (uses self_addr sentinel)
+//   R8 MEDIUM   — MAX_OWNER_COUNT cap added (prevents gas DoS)
+//   R9 MEDIUM   — MAX_TX_COUNT cap added (prevents storage DoS)
+//   R10 MEDIUM  — Parsed substrings validated (digits, addresses) before use
+//   R12 LOW     — Underflow guard added to revoke_confirmation
+//   R14 LOW     — Failed executions keep tx_executed=true (cannot retry)
+//
+// Reference patterns studied:
+//   - https://github.com/octra-labs/program-examples/multisig/main.aml
+//   - https://github.com/safe-global/safe-contracts (Gnosis Safe v1.5)
+//   - https://github.com/OpenZeppelin/openzeppelin-contracts (SafeERC20)
+// ============================================================================
+
+contract OctraSafe {
+
+  // Hard caps to prevent gas/storage DoS
+  const MAX_OWNERS: int = 50
+  const MAX_TX_COUNT: int = 10000
+
+  state {
+    // Owner set
+    owners: map[address]bool
+    owner_list: map[int]address
+    owner_count: int
+
+    // Multi-sig threshold (number of confirmations required to execute)
+    threshold: int
+
+    // Transaction counter (next tx id)
+    tx_count: int
+
+    // Transaction data
+    tx_to: map[int]address
+    tx_value: map[int]int
+    tx_data: map[int]string       // arbitrary payload (action key + args)
+    tx_executed: map[int]bool
+
+    // Confirmation tracking: confirmations[tx_id][owner] = bool
+    confirmations: map[int]map[address]bool
+    conf_count: map[int]int
+
+    // Reentrancy guard (defense-in-depth; nonreentrant keyword also applied)
+    _reentrancy_guard: bool
+  }
+
+  // --- Events ---
+  event ExecutionSuccess(tx_id: int)
+  event ExecutionFailure(tx_id: int)
+  event Deposit(sender: address, amount: int)
+  event OwnerAdded(owner: address)
+  event OwnerRemoved(owner: address)
+  event ThresholdChanged(threshold: int)
+  event Confirmation(sender: address, tx_id: int)
+  event Revocation(sender: address, tx_id: int)
+  event Submission(tx_id: int)
+
+  // --- Constructor ---
+  // Creates a 1-of-1 Safe with the deployer (origin) as the sole owner.
+  // To create an N-of-M Safe, deploy 1-of-1 then submit add_owner multi-sig
+  // transactions one at a time (each requires the current threshold to pass).
+  // This is a deliberate trade-off: AML constructors accept only scalars,
+  // so we cannot pass an owners[] array in a single constructor call.
+  constructor(threshold_val: int) {
+    require(threshold_val > 0, "threshold must be > 0")
+    require(threshold_val <= 1, "threshold exceeds initial owners")
+    self.threshold = threshold_val
+    self.tx_count = 0
+    self.owner_count = 1
+    self.owners[origin] = true
+    self.owner_list[0] = origin
+    self._reentrancy_guard = false
+    emit OwnerAdded(origin)
+    emit ThresholdChanged(threshold_val)
+  }
+
+  // --- Access-control guards (AML pattern: private fn helpers) ---
+
+  private fn require_owner() {
+    require(self.owners[caller], "not owner")
+  }
+
+  // R1 FIX: Owner-management functions can ONLY be called by the Safe itself
+  // (i.e., from within execute_transaction after the multi-sig threshold has
+  // been met). This prevents a single compromised owner from bypassing the
+  // multi-sig by calling add_owner/remove_owner/change_threshold directly.
+  // Mirrors Gnosis Safe's `requireSelfCall()` from SelfAuthorized.sol.
+  private fn require_self_call() {
+    require(caller == self_addr, "only self via execute_transaction")
+  }
+
+  private fn require_tx_exists(id: int) {
+    require(id >= 0, "invalid tx id")
+    require(id < self.tx_count, "tx does not exist")
+  }
+
+  private fn require_not_executed(id: int) {
+    require(!self.tx_executed[id], "tx already executed")
+  }
+
+  private fn require_not_confirmed(id: int) {
+    require(!self.confirmations[id][caller], "tx already confirmed")
+  }
+
+  private fn require_confirmed_enough(id: int) {
+    require(self.conf_count[id] >= self.threshold, "not enough confirmations")
+  }
+
+  // R3 FIX: Reentrancy guard. defense-in-depth on top of nonreentrant keyword.
+  private fn require_not_reentering() {
+    require(!self._reentrancy_guard, "reentrancy blocked")
+  }
+
+  // R10 FIX: Validate that a string consists only of digit characters (0-9).
+  // Used before to_int() to prevent surprising parser behavior on edge inputs.
+  private fn require_digits_only(s: string) {
+    require(len(s) > 0, "empty number")
+    let i = 0
+    while i < len(s) {
+      let c = substr(s, i, i + 1)
+      require(c >= "0" && c <= "9", "non-digit in number")
+      i += 1
+    }
+  }
+
+  // --- Receive native OCT ---
+  // Non-reentrant: even though this only emits an event, defense-in-depth.
+  nonreentrant payable fn receive(): bool {
+    require(value > 0, "must send OCT")
+    emit Deposit(caller, value)
+    return true
+  }
+
+  // ===========================================================================
+  // Owner management — R1 FIX: ALL of these now require_self_call().
+  // They can only be invoked from inside execute_transaction() after the
+  // multi-sig threshold has been met. Direct calls from any owner will revert.
+  // ===========================================================================
+
+  fn add_owner(new_owner: address): bool {
+    require_self_call()                       // R1 FIX
+    assert_address(new_owner)
+    require(!self.owners[new_owner], "already owner")
+    require(new_owner != self_addr, "cannot add self")
+    require(self.owner_count < MAX_OWNERS, "max owners reached")  // R8 FIX
+    self.owners[new_owner] = true
+    let idx = self.owner_count
+    self.owner_list[idx] = new_owner
+    self.owner_count = idx + 1
+    emit OwnerAdded(new_owner)
+    return true
+  }
+
+  fn remove_owner(old_owner: address): bool {
+    require_self_call()                       // R1 FIX
+    assert_address(old_owner)
+    require(self.owners[old_owner], "not an owner")
+    require(self.owner_count > 1, "cannot remove last owner")
+    self.owners[old_owner] = false
+    let n = self.owner_count
+    // Compact owner_list by overwriting removed slot with last
+    let i = 0
+    let found = -1
+    while i < n {
+      if self.owner_list[i] == old_owner {
+        found = i
+      }
+      i += 1
+    }
+    if found >= 0 {
+      self.owner_list[found] = self.owner_list[n - 1]
+      // R7 FIX: Use self_addr as sentinel (NOT caller, which left stale
+      // duplicate data in storage). self_addr is never returned by
+      // get_owner_at() because owner_count is decremented below.
+      self.owner_list[n - 1] = self_addr
+    }
+    self.owner_count = n - 1
+    // Auto-adjust threshold DOWN if it now exceeds owner_count.
+    // (With R1 fix, this auto-adjust is safe because it requires multi-sig
+    //  to invoke; a single owner cannot force the threshold down.)
+    if self.threshold > self.owner_count {
+      self.threshold = self.owner_count
+      emit ThresholdChanged(self.owner_count)
+    }
+    emit OwnerRemoved(old_owner)
+    return true
+  }
+
+  fn replace_owner(old_owner: address, new_owner: address): bool {
+    require_self_call()                       // R1 FIX
+    assert_address(new_owner)
+    require(self.owners[old_owner], "old owner not found")
+    require(!self.owners[new_owner], "new owner already exists")
+    require(new_owner != self_addr, "cannot replace with self")
+    self.owners[old_owner] = false
+    self.owners[new_owner] = true
+    let n = self.owner_count
+    let i = 0
+    while i < n {
+      if self.owner_list[i] == old_owner {
+        self.owner_list[i] = new_owner
+      }
+      i += 1
+    }
+    emit OwnerRemoved(old_owner)
+    emit OwnerAdded(new_owner)
+    return true
+  }
+
+  fn change_threshold(new_threshold: int): bool {
+    require_self_call()                       // R1 FIX
+    require(new_threshold > 0, "threshold must be > 0")
+    require(new_threshold <= self.owner_count, "threshold exceeds owners")
+    self.threshold = new_threshold
+    emit ThresholdChanged(new_threshold)
+    return true
+  }
+
+  // ===========================================================================
+  // Transaction lifecycle
+  // ===========================================================================
+
+  // submit_transaction(to, value, data)
+  // Creates a new pending multi-sig transaction and auto-confirms by sender.
+  // Returns the new tx_id.
+  //
+  // R4 FIX: Always validate `to` (was: only when value > 0).
+  // R5 FIX: Reject no-op txs (value=0 AND data="").
+  // R9 FIX: Cap total tx_count to prevent storage DoS.
+  nonreentrant fn submit_transaction(to: address, value_amt: int, data: string): int {
+    require_owner()
+    require(value_amt >= 0, "value cannot be negative")
+    require(value_amt > 0 || len(data) > 0, "tx must have value or data")  // R5 FIX
+    assert_address(to)                                                       // R4 FIX
+    require(self.tx_count < MAX_TX_COUNT, "tx queue full")                   // R9 FIX
+
+    let id = self.tx_count
+    self.tx_to[id] = to
+    self.tx_value[id] = value_amt
+    self.tx_data[id] = data
+    self.tx_executed[id] = false
+    self.conf_count[id] = 0
+    self.tx_count = id + 1
+    emit Submission(id)
+    // Auto-confirm by submitter
+    self.confirmations[id][caller] = true
+    self.conf_count[id] = 1
+    emit Confirmation(caller, id)
+    return id
+  }
+
+  nonreentrant fn confirm_transaction(id: int): bool {
+    require_owner()
+    require_tx_exists(id)
+    require_not_executed(id)
+    require_not_confirmed(id)
+    self.confirmations[id][caller] = true
+    self.conf_count[id] = self.conf_count[id] + 1
+    emit Confirmation(caller, id)
+    return true
+  }
+
+  nonreentrant fn revoke_confirmation(id: int): bool {
+    require_owner()
+    require_tx_exists(id)
+    require_not_executed(id)
+    require(self.confirmations[id][caller], "not confirmed yet")
+    require(self.conf_count[id] > 0, "underflow guard")                      // R12 FIX
+    self.confirmations[id][caller] = false
+    self.conf_count[id] = self.conf_count[id] - 1
+    emit Revocation(caller, id)
+    return true
+  }
+
+  // execute_transaction(id)
+  //
+  // Dispatches the tx based on tx_data content:
+  //   ""                                → plain native OCT transfer
+  //   "add_owner:<addr>"                → calls add_owner() (self-call gated)
+  //   "remove_owner:<addr>"             → calls remove_owner() (self-call gated)
+  //   "change_threshold:<int>"          → calls change_threshold() (self-call gated)
+  //   "transfer:<recipient>:<amount>"   → calls token.transfer(recipient, amount)
+  //                                       (to_addr MUST be the token contract)
+  //   "grant:<spender>:<amount>"        → calls token.grant(spender, amount)
+  //                                       (to_addr MUST be the token contract)
+  //   (anything else with value > 0)    → plain native OCT transfer
+  //
+  // R2 FIX (CRITICAL): tx_executed[id] is set to true BEFORE any external
+  //   call (CEI pattern). A reentrant callback cannot re-enter and double-
+  //   execute the same tx_id.
+  // R3 FIX: nonreentrant keyword applied for defense-in-depth.
+  // R10 FIX: Parsed substrings validated (digits for amounts, addresses via
+  //   assert_address) before use.
+  // R14 FIX: On failure, tx_executed stays true (cannot retry). This matches
+  //   Gnosis Safe semantics — once an execution is attempted (success or
+  //   fail), the tx is "consumed". To redo, submit a new tx.
+  nonreentrant fn execute_transaction(id: int): bool {
+    require_owner()
+    require_tx_exists(id)
+    require_not_executed(id)
+    require_confirmed_enough(id)
+    require_not_reentering()                                                 // R3 FIX
+
+    // R2 FIX (CRITICAL): EFFECTS FIRST — mark executed before any external call.
+    // If the external call reverts, the entire tx (including this flag set)
+    // rolls back, so the tx can be retried. If the external call returns
+    // false (soft failure), the flag stays set and the tx cannot be retried.
+    self.tx_executed[id] = true
+    self._reentrancy_guard = true
+
+    let to_addr = self.tx_to[id]
+    let val = self.tx_value[id]
+    let data = self.tx_data[id]
+    let ok = false
+
+    if len(data) == 0 {
+      // Plain native OCT transfer
+      require(val > 0, "nothing to execute")
+      ok = transfer(to_addr, val)
+    } else {
+      // Dispatch based on prefix of data.
+      // Owner-management actions delegate to add_owner/remove_owner/change_threshold
+      // which now require_self_call() — caller inside them will be self_addr
+      // because we're inside the Safe's own execute_transaction.
+      if starts_with(data, "add_owner:") {
+        let addr_str = substr(data, 10, len(data))
+        ok = add_owner(addr_str)            // assert_address runs inside add_owner
+      } else {
+        if starts_with(data, "remove_owner:") {
+          let addr_str = substr(data, 13, len(data))
+          ok = remove_owner(addr_str)
+        } else {
+          if starts_with(data, "change_threshold:") {
+            let num_str = substr(data, 17, len(data))
+            require_digits_only(num_str)                                  // R10 FIX
+            let new_t = to_int(num_str)
+            ok = change_threshold(new_t)
+          } else {
+            // OCS-01 token transfer via the Safe.
+            // Format: "transfer:<recipient_addr>:<amount>"
+            if starts_with(data, "transfer:") {
+              let rest = substr(data, 9, len(data))
+              let sep_idx = index_of(rest, ":")
+              require(sep_idx > 0, "invalid transfer data: missing separator")
+              let recipient = substr(rest, 0, sep_idx)
+              let amount_str = substr(rest, sep_idx + 1, len(rest))
+              require_digits_only(amount_str)                            // R10 FIX
+              assert_address(recipient)                                  // R10 FIX
+              let amt = to_int(amount_str)
+              require(amt > 0, "transfer amount must be positive")
+              ok = call(to_addr, "transfer", recipient, amt)
+              require(ok, "token transfer failed")
+            } else {
+              // OCS-01 token grant (approve equivalent).
+              // Format: "grant:<spender_addr>:<amount>"
+              if starts_with(data, "grant:") {
+                let rest = substr(data, 6, len(data))
+                let sep_idx = index_of(rest, ":")
+                require(sep_idx > 0, "invalid grant data: missing separator")
+                let spender = substr(rest, 0, sep_idx)
+                let amount_str = substr(rest, sep_idx + 1, len(rest))
+                require_digits_only(amount_str)                          // R10 FIX
+                assert_address(spender)                                  // R10 FIX
+                let amt = to_int(amount_str)
+                require(amt > 0, "grant amount must be positive")
+                ok = call(to_addr, "grant", spender, amt)
+                require(ok, "token grant failed")
+              } else {
+                // Unknown action — treat as raw external call with value
+                if val > 0 {
+                  ok = transfer(to_addr, val)
+                } else {
+                  // No-op: data present but unrecognized, and no value.
+                  // Fail loudly so users don't think it executed.
+                  ok = false
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Clear reentrancy guard before emitting events (events can't reenter
+    // in AML, but be defensive).
+    self._reentrancy_guard = false
+
+    if ok {
+      emit ExecutionSuccess(id)
+    } else {
+      // R14 FIX: Don't revert — keep tx_executed=true and emit ExecutionFailure.
+      // The tx is consumed and cannot be retried. Caller sees return=false.
+      emit ExecutionFailure(id)
+      return false
+    }
+    return true
+  }
+
+  // --- Read-only view functions ---
+
+  view fn get_owner_count(): int {
+    return self.owner_count
+  }
+
+  view fn get_threshold(): int {
+    return self.threshold
+  }
+
+  view fn get_transaction_count(): int {
+    return self.tx_count
+  }
+
+  view fn get_owner_at(idx: int): address {
+    require(idx >= 0, "invalid idx")
+    require(idx < self.owner_count, "idx out of range")
+    return self.owner_list[idx]
+  }
+
+  view fn is_owner(addr: address): bool {
+    return self.owners[addr]
+  }
+
+  view fn get_transaction(id: int): string {
+    require(id >= 0, "invalid id")
+    require(id < self.tx_count, "tx does not exist")
+    // AML view fns cannot easily return structs; we encode as CSV string:
+    //   "<to>|<value>|<executed_int>|<data>"
+    let s = to_string(self.tx_to[id])
+    s = concat(s, "|")
+    s = concat(s, to_string(self.tx_value[id]))
+    s = concat(s, "|")
+    if self.tx_executed[id] {
+      s = concat(s, "1")
+    } else {
+      s = concat(s, "0")
+    }
+    s = concat(s, "|")
+    s = concat(s, self.tx_data[id])
+    return s
+  }
+
+  view fn get_confirmation_count(id: int): int {
+    require(id >= 0, "invalid id")
+    require(id < self.tx_count, "tx does not exist")
+    return self.conf_count[id]
+  }
+
+  view fn is_confirmed_by(id: int, owner: address): bool {
+    require(id >= 0, "invalid id")
+    require(id < self.tx_count, "tx does not exist")
+    return self.confirmations[id][owner]
+  }
+
+  view fn get_safe_balance(): int {
+    return balance(self_addr)
+  }
+
+  // Returns CSV of all owners: "addr1,addr2,..."
+  view fn get_owners(): string {
+    let s = ""
+    let n = self.owner_count
+    let i = 0
+    while i < n {
+      if i > 0 {
+        s = concat(s, ",")
+      }
+      s = concat(s, to_string(self.owner_list[i]))
+      i += 1
+    }
+    return s
+  }
+}

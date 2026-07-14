@@ -1,0 +1,243 @@
+// ============================================================================
+// TestOCS01 — OCS-01 Standard Token Implementation for Devnet Testing
+// ----------------------------------------------------------------------------
+// SECURITY AUDIT FINDINGS ADDRESSED (see SECURITY-AUDIT-REPORT.md):
+//   T1  LOW — Zero/sentinel address rejected in transfer/pull/mint
+//   T2  LOW — transfer to self_addr (token contract) rejected
+//   T5  MEDIUM — Defensive overflow check added (balances[to] + amt <= MAX)
+//   T6  LOW — increase_grant / decrease_grant now block self-grant + cap value
+//   T7  LOW — mint to self_addr rejected (would irrecoverably burn tokens)
+//   T10 LOW — nonreentrant applied to all state-changing entrypoints; pull
+//             reorders effects to follow strict CEI
+//   T11 LOW — grant(amt >= 0) check added (was: negative allowance possible)
+//
+// Reference: https://github.com/octra-labs/program-examples/token/main.aml
+// ============================================================================
+
+import IOCS01 from "interfaces/IOCS01.aml"
+
+contract TestOCS01 implements IOCS01 {
+
+  const MAX_SUPPLY: int = 1000000000000000   // 1 billion * 1e6 (with 6 decimals)
+
+  // Canonical zero/sentinel address (valid base58 but nobody holds the key)
+  const ZERO_ADDR: address = "oct1111111111111111111111111111111111111111111111111"
+
+  state {
+    name: string
+    symbol: string
+    total_supply: int
+    decimals: int
+    owner: address
+    balances: map[address]int
+    grants: map[address]map[address]int
+  }
+
+  event Transfer(from: address, to: address, amount: int)
+  event Grant(owner: address, spender: address, amount: int)
+  event Mint(to: address, amount: int)
+  event Burn(from: address, amount: int)
+  event OwnershipTransferred(old_owner: address, new_owner: address)
+
+  constructor(n: string, s: string, supply: int, dec: int) {
+    require(len(n) > 0, "name empty")
+    require(len(n) <= 32, "name too long")
+    require(len(s) > 0, "symbol empty")
+    require(len(s) <= 12, "symbol too long")
+    require(supply > 0, "supply must be positive")
+    require(supply <= MAX_SUPPLY, "supply too large")
+    require(dec >= 0, "decimals negative")
+    require(dec <= 18, "decimals too high")
+
+    self.name = n
+    self.symbol = s
+    self.total_supply = supply
+    self.decimals = dec
+    self.owner = origin
+    self.balances[origin] = supply
+    emit Transfer(origin, origin, supply)
+  }
+
+  // --- Owner-only mint for faucet/testing ---
+  // T7 FIX: reject mint to self_addr (token contract itself) and ZERO_ADDR.
+  // T5 FIX: defensive overflow check on recipient balance.
+  nonreentrant fn mint(to: address, amount: int): bool {
+    require(caller == self.owner, "only owner can mint")
+    assert_address(to)
+    require(to != self_addr, "cannot mint to token contract")        // T7 FIX
+    require(to != ZERO_ADDR, "cannot mint to zero address")          // T1 FIX
+    require(amount > 0, "amount must be positive")
+    let new_supply = self.total_supply + amount
+    require(new_supply <= MAX_SUPPLY, "would exceed max supply")
+    let new_to_bal = self.balances[to] + amount
+    require(new_to_bal <= MAX_SUPPLY, "recipient balance overflow")  // T5 FIX
+    self.balances[to] = new_to_bal
+    self.total_supply = new_supply
+    emit Mint(to, amount)
+    emit Transfer(self_addr, to, amount)
+    return true
+  }
+
+  // --- Optional burn (owner-only, reduces total supply) ---
+  // T9 (audit note): burn is optional but useful for testing deflation.
+  nonreentrant fn burn(from: address, amount: int): bool {
+    require(caller == self.owner, "only owner can burn")
+    assert_address(from)
+    require(from != ZERO_ADDR, "cannot burn from zero address")
+    require(amount > 0, "amount must be positive")
+    let bal = self.balances[from]
+    require(bal >= amount, "insufficient balance to burn")
+    self.balances[from] = bal - amount
+    self.total_supply = self.total_supply - amount
+    emit Burn(from, amount)
+    emit Transfer(from, self_addr, amount)
+    return true
+  }
+
+  // --- Owner management (T8 FIX) ---
+  nonreentrant fn transfer_ownership(new_owner: address): bool {
+    require(caller == self.owner, "only owner")
+    assert_address(new_owner)
+    require(new_owner != ZERO_ADDR, "cannot transfer to zero address")
+    require(new_owner != self_addr, "cannot transfer to token contract")
+    require(new_owner != self.owner, "already owner")
+    let old = self.owner
+    self.owner = new_owner
+    emit OwnershipTransferred(old, new_owner)
+    return true
+  }
+
+  // --- OCS-01 required view functions ---
+
+  view fn get_name(): string {
+    return self.name
+  }
+
+  view fn get_symbol(): string {
+    return self.symbol
+  }
+
+  view fn get_total_supply(): int {
+    return self.total_supply
+  }
+
+  view fn decimals(): int {
+    return self.decimals
+  }
+
+  view fn balance_of(addr: address): int {
+    return self.balances[addr]
+  }
+
+  view fn allowance(owner_addr: address, spender: address): int {
+    return self.grants[owner_addr][spender]
+  }
+
+  view fn get_owner(): address {
+    return self.owner
+  }
+
+  // --- OCS-01 required state-changing functions ---
+
+  // T1+T2+T5+T10 FIXES applied.
+  nonreentrant fn transfer(to: address, amt: int): bool {
+    assert_address(to)
+    require(amt > 0, "amount must be positive")
+    require(to != caller, "self transfer disabled")
+    require(to != self_addr, "transfer to token contract disabled")  // T2 FIX
+    require(to != ZERO_ADDR, "transfer to zero address disabled")    // T1 FIX
+    let bal = self.balances[caller]
+    require(bal >= amt, "insufficient balance")
+    let new_to_bal = self.balances[to] + amt
+    require(new_to_bal <= MAX_SUPPLY, "recipient balance overflow")  // T5 FIX
+    // CEI: effects (state updates) — already in correct order
+    self.balances[caller] = bal - amt
+    self.balances[to] = new_to_bal
+    emit Transfer(caller, to, amt)
+    return true
+  }
+
+  // T11 FIX: reject negative grant amounts.
+  // T4 NOTE: This is the "hard reset" pattern. Frontends SHOULD prefer
+  //   increase_grant / decrease_grant to avoid the classic ERC-20 approve
+  //   race. We additionally enforce the two-step pattern: if a non-zero
+  //   grant already exists, the caller MUST first set it to 0 (or use
+  //   revoke_grant) before setting a new non-zero value. This is the
+  //   OpenZeppelin SafeERC20 forceApprove pattern.
+  nonreentrant fn grant(spender: address, amt: int): bool {
+    assert_address(spender)
+    require(spender != caller, "self grant disabled")
+    require(amt >= 0, "amount cannot be negative")                   // T11 FIX
+    require(spender != self_addr, "grant to token contract disabled")
+    require(spender != ZERO_ADDR, "grant to zero address disabled")  // T1 FIX
+    let current = self.grants[caller][spender]
+    require(current == 0 || amt == 0, "reset grant first; use increase/decrease")  // T4 FIX
+    self.grants[caller][spender] = amt
+    emit Grant(caller, spender, amt)
+    return true
+  }
+
+  // T3+T5+T10 FIXES applied.
+  // CEI: allowance decrement FIRST, then balance updates.
+  nonreentrant fn pull(from: address, to: address, amt: int): bool {
+    assert_address(from)
+    assert_address(to)
+    require(amt > 0, "amount must be positive")
+    require(from != to, "self pull disabled")
+    require(to != self_addr, "pull to token contract disabled")      // T2 FIX
+    require(to != ZERO_ADDR, "pull to zero address disabled")        // T1 FIX
+    let allowed = self.grants[from][caller]
+    require(allowed >= amt, "not allowed")
+    let bal = self.balances[from]
+    require(bal >= amt, "insufficient balance")
+    let new_to_bal = self.balances[to] + amt
+    require(new_to_bal <= MAX_SUPPLY, "recipient balance overflow")  // T5 FIX
+    // CEI: effects in order — allowance first, then balances
+    self.grants[from][caller] = allowed - amt                        // T10 FIX (effect 1)
+    self.balances[from] = bal - amt                                  // (effect 2)
+    self.balances[to] = new_to_bal                                   // (effect 3)
+    emit Transfer(from, to, amt)
+    return true
+  }
+
+  // --- Convenience helpers ---
+
+  // T6 FIX: enforce self-grant block + cap at MAX_SUPPLY.
+  nonreentrant fn increase_grant(spender: address, added: int): bool {
+    assert_address(spender)
+    require(added > 0, "amount must be positive")
+    require(spender != caller, "self grant disabled")                // T6 FIX
+    require(spender != self_addr, "grant to token contract disabled")
+    require(spender != ZERO_ADDR, "grant to zero address disabled")
+    let current = self.grants[caller][spender]
+    let next = current + added
+    require(next <= MAX_SUPPLY, "grant too large")                   // T6 FIX
+    self.grants[caller][spender] = next
+    emit Grant(caller, spender, next)
+    return true
+  }
+
+  // T6 FIX: enforce self-grant block (already had underflow check).
+  nonreentrant fn decrease_grant(spender: address, subtracted: int): bool {
+    assert_address(spender)
+    require(subtracted > 0, "amount must be positive")
+    require(spender != caller, "self grant disabled")                // T6 FIX
+    require(spender != self_addr, "grant to token contract disabled")
+    require(spender != ZERO_ADDR, "grant to zero address disabled")
+    let current = self.grants[caller][spender]
+    require(current >= subtracted, "allowance underflow")
+    let next = current - subtracted
+    self.grants[caller][spender] = next
+    emit Grant(caller, spender, next)
+    return true
+  }
+
+  nonreentrant fn revoke_grant(spender: address): bool {
+    assert_address(spender)
+    require(spender != self_addr, "grant to token contract disabled")
+    require(spender != ZERO_ADDR, "grant to zero address disabled")
+    self.grants[caller][spender] = 0
+    emit Grant(caller, spender, 0)
+    return true
+  }
+}
