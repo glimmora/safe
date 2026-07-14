@@ -12,6 +12,7 @@ import { Loader2, Wallet, Download, ExternalLink, CheckCircle2, AlertCircle } fr
 import { Modal } from '@/components/ui/Modal'
 import { Button } from '@/components/ui/Button'
 import { useWallet } from '@/hooks/useWallet'
+import { useWalletStore } from '@/stores/useWalletStore'
 import { is0xioExtensionInstalled, ZEROXIO_INSTALL_URL, ZEROXIO_DOCS_URL } from '@/lib/zerozio'
 
 export function AccountModal({ isOpen, onClose }: { isOpen: boolean; onClose: () => void }) {
@@ -20,7 +21,12 @@ export function AccountModal({ isOpen, onClose }: { isOpen: boolean; onClose: ()
 
   const handleConnect = async () => {
     await connect()
-    onClose()
+    // Only close the modal if connect actually succeeded.
+    // If user rejected or wallet is locked, keep modal open so they can retry.
+    const connected = useWalletStore.getState().isConnected
+    if (connected) {
+      onClose()
+    }
   }
 
   return (

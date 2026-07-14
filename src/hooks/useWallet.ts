@@ -1,29 +1,30 @@
 // ============================================================================
-// hooks/useWallet.ts — Wallet connection via 0xio extension
+// hooks/useWallet.ts — Wallet connection via 0xio extension (GLOBAL STATE)
 // ----------------------------------------------------------------------------
-// REFACTOR: OctraSafe now uses 0xio wallet EXCLUSIVELY. The in-browser
-// ed25519 wallet (signer.ts) has been removed. All signing happens inside
-// the 0xio browser extension's isolated background context — the dApp never
-// sees the private key.
+// REFACTOR: State sekarang di-shared via useWalletStore (zustand) agar semua
+// komponen yang panggil useWallet() share state yang sama. Sebelumnya pakai
+// useState lokal → setiap komponen punya state sendiri → bug "tombol connect
+// masih ada setelah connect".
 //
 // Install: https://chromewebstore.google.com/detail/0xio-wallet/anknhjilldkeelailocijnfibefmepcc
 // Docs: https://docs.0xio.xyz/
 // ============================================================================
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 import { toast } from 'sonner'
 import {
   initWallet, getWallet, connectWallet, disconnectWallet,
-  getConnectionInfo, getBalance, getAddress, getNetworkId, switchNetwork,
+  getConnectionInfo, getBalance, switchNetwork,
   sendNativeOct, callContract, callContractView, signMessage as zeroxioSignMessage,
   deployContract as zeroxioDeployContract,
-  is0xioExtensionInstalled, ZeroXioNotInstalledError, ZeroXioUserRejectedError,
+  is0xioExtensionInstalled,
   ZEROXIO_INSTALL_URL,
   type Balance, type NetworkInfo, type TransactionResult, type DeployResult,
 } from '@/lib/zerozio'
+import { useWalletStore } from '@/stores/useWalletStore'
 
 export interface WalletHook {
-  // State
+  // State (from global store)
   address: string | null
   isConnected: boolean
   isConnecting: boolean
@@ -62,18 +63,39 @@ export interface WalletHook {
   installUrl: string
 }
 
+// Track whether we've initialized the wallet SDK + event subscriptions
+// (singleton — only run once across all hook instances)
+let _initDone = false
+let _refreshTimer: number | null = null
+
 export function useWallet(): WalletHook {
-  const [address, setAddress] = useState<string | null>(null)
-  const [isConnected, setIsConnected] = useState(false)
-  const [isConnecting, setIsConnecting] = useState(false)
-  const [isAvailable, setIsAvailable] = useState(false)
-  const [balance, setBalance] = useState<Balance | null>(null)
-  const [networkId, setNetworkId] = useState<string | null>(null)
-  const [networkInfo, setNetworkInfo] = useState<NetworkInfo | null>(null)
+  // Read state from global store — any component calling useWallet() sees
+  // the SAME state, so when AccountModal sets isConnected=true, ConnectButton
+  // re-renders and shows the account dropdown.
+  const address = useWalletStore((s) => s.address)
+  const isConnected = useWalletStore((s) => s.isConnected)
+  const isConnecting = useWalletStore((s) => s.isConnecting)
+  const isAvailable = useWalletStore((s) => s.isAvailable)
+  const isInitialized = useWalletStore((s) => s.isInitialized)
+  const balance = useWalletStore((s) => s.balance)
+  const networkId = useWalletStore((s) => s.networkId)
+  const networkInfo = useWalletStore((s) => s.networkInfo)
+
+  const setConnected = useWalletStore((s) => s.setConnected)
+  const setIsConnecting = useWalletStore((s) => s.setIsConnecting)
+  const setIsAvailable = useWalletStore((s) => s.setIsAvailable)
+  const setIsInitialized = useWalletStore((s) => s.setIsInitialized)
+  const setBalance = useWalletStore((s) => s.setBalance)
+  const setNetworkInfo = useWalletStore((s) => s.setNetworkInfo)
+  const reset = useWalletStore((s) => s.reset)
+
   const refreshTimerRef = useRef<number | null>(null)
 
-  // --- Initial detect & auto-reconnect ---
+  // --- Initial detect & auto-reconnect (runs ONCE across all instances) ---
   useEffect(() => {
+    if (_initDone) return
+    _initDone = true
+
     let cancelled = false
 
     const init = async () => {
@@ -81,6 +103,7 @@ export function useWallet(): WalletHook {
       if (cancelled) return
 
       setIsAvailable(available)
+      setIsInitialized(true)
       if (!available || !wallet) return
 
       // Try to auto-reconnect if user previously approved
@@ -88,39 +111,43 @@ export function useWallet(): WalletHook {
         const info = await wallet.getConnectionStatus()
         if (cancelled) return
         if (info.isConnected && info.address) {
-          setAddress(info.address)
-          setIsConnected(true)
-          setBalance(info.balance ?? null)
-          setNetworkInfo(info.networkInfo ?? null)
-          setNetworkId(info.networkInfo?.id ?? null)
+          setConnected({
+            address: info.address,
+            balance: info.balance ?? { public: 0, total: 0, currency: 'OCT' },
+            networkInfo: info.networkInfo ?? {
+              id: 'devnet',
+              name: 'Devnet',
+              rpcUrl: 'https://devnet.octrascan.io/rpc',
+              isTestnet: true,
+              supportsPrivacy: false,
+            } as NetworkInfo,
+          })
         }
       } catch (e) {
         console.warn('[useWallet] auto-reconnect check failed', e)
       }
 
-      // Subscribe to wallet events
+      // Subscribe to wallet events — these update the GLOBAL store so all
+      // components re-render automatically.
       const onAccountChanged = (event: any) => {
         const newAddr = event?.data?.newAddress ?? event?.newAddress
         if (newAddr) {
-          setAddress(newAddr)
+          useWalletStore.getState().setAddress(newAddr)
           toast.info('Account changed', { description: newAddr.slice(0, 12) + '...' })
         }
       }
       const onDisconnect = () => {
-        setAddress(null)
-        setIsConnected(false)
-        setBalance(null)
+        useWalletStore.getState().reset()
         toast.info('Wallet disconnected')
       }
       const onBalanceChanged = (event: any) => {
         const newBal = event?.data?.newBalance ?? event?.newBalance
-        if (newBal) setBalance(newBal)
+        if (newBal) useWalletStore.getState().setBalance(newBal)
       }
       const onNetworkChanged = (event: any) => {
         const newNet = event?.data?.newNetwork ?? event?.newNetwork
         if (newNet) {
-          setNetworkInfo(newNet)
-          setNetworkId(newNet.id)
+          useWalletStore.getState().setNetworkInfo(newNet)
           toast.info('Network changed', { description: newNet.name })
         }
       }
@@ -128,8 +155,12 @@ export function useWallet(): WalletHook {
         toast.info('0xio wallet locked', { description: 'Unlock it to continue' })
       }
       const onExtensionUnlocked = () => {
-        // Refresh state after unlock
-        refresh()
+        // Refresh state after unlock — read fresh from store
+        const store = useWalletStore.getState()
+        if (store.isConnected) {
+          store.setBalance
+          getBalance(true).then((b) => { if (b) store.setBalance(b) }).catch(() => {})
+        }
       }
 
       wallet.on('accountChanged', onAccountChanged)
@@ -139,38 +170,43 @@ export function useWallet(): WalletHook {
       wallet.on('extensionLocked', onExtensionLocked)
       wallet.on('extensionUnlocked', onExtensionUnlocked)
 
-      return () => {
-        wallet.off('accountChanged', onAccountChanged)
-        wallet.off('disconnect', onDisconnect)
-        wallet.off('balanceChanged', onBalanceChanged)
-        wallet.off('networkChanged', onNetworkChanged)
-        wallet.off('extensionLocked', onExtensionLocked)
-        wallet.off('extensionUnlocked', onExtensionUnlocked)
-      }
+      // Note: we intentionally don't unsubscribe — the wallet instance is a
+      // singleton that lives for the page lifetime.
     }
 
     init()
     return () => { cancelled = true }
-  }, [])
+  }, [setIsAvailable, setIsInitialized, setConnected])
 
   // --- Auto-refresh balance every 30s when connected ---
   useEffect(() => {
     if (!isConnected) return
-    refresh()
-    refreshTimerRef.current = window.setInterval(refresh, 30000)
+
+    const doRefresh = async () => {
+      try {
+        const [bal, info] = await Promise.all([getBalance(true), getConnectionInfo()])
+        if (bal) setBalance(bal)
+        if (info.networkInfo) setNetworkInfo(info.networkInfo)
+      } catch (e) {
+        console.warn('[useWallet] refresh failed', e)
+      }
+    }
+
+    doRefresh()
+    refreshTimerRef.current = window.setInterval(doRefresh, 30000)
+    if (_refreshTimer === null) _refreshTimer = refreshTimerRef.current
     return () => {
       if (refreshTimerRef.current) {
         clearInterval(refreshTimerRef.current)
         refreshTimerRef.current = null
       }
     }
-  }, [isConnected])
+  }, [isConnected, setBalance, setNetworkInfo])
 
   // --- Connect ---
   const connect = useCallback(async () => {
     setIsConnecting(true)
     try {
-      // Check extension installed
       if (!is0xioExtensionInstalled()) {
         toast.error('0xio wallet not detected', {
           description: 'Install the Chrome extension to continue',
@@ -183,11 +219,13 @@ export function useWallet(): WalletHook {
         return
       }
       const result = await connectWallet()
-      setAddress(result.address)
-      setIsConnected(true)
-      setBalance(result.balance)
-      setNetworkInfo(result.networkInfo)
-      setNetworkId(result.networkInfo.id)
+      // Update GLOBAL store — this triggers re-render in ALL components
+      // that read from useWalletStore (including ConnectButton)
+      setConnected({
+        address: result.address,
+        balance: result.balance,
+        networkInfo: result.networkInfo,
+      })
       toast.success('Connected to 0xio wallet', {
         description: result.address.slice(0, 12) + '...' + result.address.slice(-6),
       })
@@ -203,7 +241,7 @@ export function useWallet(): WalletHook {
     } finally {
       setIsConnecting(false)
     }
-  }, [])
+  }, [setConnected, setIsConnecting])
 
   // --- Disconnect ---
   const disconnect = useCallback(async () => {
@@ -212,26 +250,22 @@ export function useWallet(): WalletHook {
     } catch (e) {
       console.warn('[useWallet] disconnect failed', e)
     }
-    setAddress(null)
-    setIsConnected(false)
-    setBalance(null)
+    reset()
     toast.info('Wallet disconnected')
-  }, [])
+  }, [reset])
 
   // --- Refresh balance & connection status ---
   const refresh = useCallback(async () => {
-    if (!isConnected) return
+    const store = useWalletStore.getState()
+    if (!store.isConnected) return
     try {
       const [bal, info] = await Promise.all([getBalance(true), getConnectionInfo()])
-      if (bal) setBalance(bal)
-      if (info.networkInfo) {
-        setNetworkInfo(info.networkInfo)
-        setNetworkId(info.networkInfo.id)
-      }
+      if (bal) store.setBalance(bal)
+      if (info.networkInfo) store.setNetworkInfo(info.networkInfo)
     } catch (e) {
       console.warn('[useWallet] refresh failed', e)
     }
-  }, [isConnected])
+  }, [])
 
   // --- Switch network ---
   const switchToNetwork = useCallback(async (id: 'mainnet' | 'devnet') => {
@@ -281,7 +315,7 @@ export function useWallet(): WalletHook {
     return zeroxioSignMessage(msg)
   }, [isConnected])
 
-  // --- Deploy smart contract (uses window.octra directly for op_type=deploy) ---
+  // --- Deploy smart contract ---
   const deployContract = useCallback(async (params: {
     bytecodeB64: string
     contractAddress: string
